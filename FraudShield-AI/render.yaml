@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: fraudshield-ai
+    runtime: docker
+    plan: free
+    region: oregon
+    branch: main
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass

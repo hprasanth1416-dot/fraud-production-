@@ -1,0 +1,130 @@
+name: FraudShield CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check dependency consistency
+        run: python -m pip check
+
+      - name: Check Python syntax
+        run: python -m py_compile app.py train.py mlflow_tracking.py test_api.py
+
+      - name: Validate dataset
+        run: |
+          python - <<'PY'
+          import csv
+          from pathlib import Path
+
+          dataset = Path("Dataset/transactions.csv")
+          required = {
+              "amount", "hour", "transaction_type", "location_mismatch",
+              "account_age_days", "transactions_last_24h", "average_amount",
+              "is_fraud",
+          }
+          with dataset.open(newline="", encoding="utf-8") as source:
+              reader = csv.DictReader(source)
+              rows = list(reader)
+              columns = set(reader.fieldnames or [])
+
+          if len(rows) != 25:
+              raise SystemExit(f"Expected 25 records, found {len(rows)}")
+          if not required.issubset(columns):
+              raise SystemExit(f"Missing columns: {sorted(required - columns)}")
+          if any(not value or not value.strip() for row in rows for value in row.values()):
+              raise SystemExit("Dataset contains missing values")
+          if len({tuple(row[column] for column in reader.fieldnames) for row in rows}) != 25:
+              raise SystemExit("Dataset contains duplicate records")
+          if {row["is_fraud"] for row in rows} != {"0", "1"}:
+              raise SystemExit("Expected both fraud labels 0 and 1")
+          if not {row["transaction_type"] for row in rows}.issubset({"online", "pos", "atm"}):
+              raise SystemExit("Unexpected transaction_type value")
+          if not {row["location_mismatch"].lower() for row in rows}.issubset(
+              {"true", "false", "0", "1"}
+          ):
+              raise SystemExit("Invalid location_mismatch value")
+
+          for row in rows:
+              for column in ("amount", "average_amount"):
+                  float(row[column])
+              for column in ("hour", "account_age_days", "transactions_last_24h", "is_fraud"):
+                  int(row[column])
+
+          print("Dataset validation passed: 25 rows, expected columns and values.")
+          PY
+
+      - name: Require API model for container validation
+        run: |
+          if [ ! -s Models/fraud_model.pkl ]; then
+            echo "Models/fraud_model.pkl is required. Train and add the real model before building."
+            exit 1
+          fi
+
+      - name: Build Docker image
+        run: docker build --tag fraudshield-ai:ci .
+
+      - name: Test Docker container
+        run: |
+          docker run --detach --rm --name fraudshield-ci \
+            --env PORT=8081 --publish 8081:8081 fraudshield-ai:ci
+          trap 'docker stop fraudshield-ci >/dev/null 2>&1 || true' EXIT
+
+          ready=0
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail http://127.0.0.1:8081/health >/dev/null; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" -ne 1 ]; then
+            docker logs fraudshield-ci
+            exit 1
+          fi
+
+          API_URL=http://127.0.0.1:8081 python test_api.py
+          python - <<'PY'
+          import requests
+
+          response = requests.post(
+              "http://127.0.0.1:8081/predict",
+              json={
+                  "amount": -1,
+                  "hour": 14,
+                  "transaction_type": "online",
+                  "location_mismatch": False,
+                  "account_age_days": 120,
+                  "transactions_last_24h": 3,
+                  "average_amount": 2500,
+              },
+              timeout=10,
+          )
+          if response.status_code != 422:
+              raise SystemExit(f"Invalid input returned HTTP {response.status_code}")
+          print("Invalid-input validation passed.")
+          PY
